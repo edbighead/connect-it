@@ -1,0 +1,207 @@
+@Library('Utilities')
+import com.connect.Utilities
+import com.connect.Helm
+
+def utils = new Utilities(this)
+def helm = new Helm(this)
+
+def mergeFiles(env,folder) {
+    def files = findFiles(glob: "${folder}/**/values.yaml") 
+    for (file in files) {
+        def valuesPath = sh(returnStdout: true, script: "dirname ${file.path}")
+        def envValues = "${valuesPath.trim()}/values.${env}.yaml"
+        sh "yq m -ix ${file.path} ${envValues}"
+    }
+}
+
+def replace (word, from, to) {
+    if (word != null) {
+        return word.replaceAll(from,to)
+    } else {
+        return ""
+    }
+} 
+
+pipeline {
+    agent any
+
+    environment {
+        SHORT_SHA = env.GIT_COMMIT.substring(0,6)
+        REPO_NAME = "k8s-frontend"
+        DOCKER_USER = "your-username"
+        DOCKER_IMAGE = "${DOCKER_USER}/${REPO_NAME}:${SHORT_SHA}"
+        ENV_NAME = env.GIT_BRANCH.toLowerCase()
+        NAMESPACE = "${REPO_NAME}-${ENV_NAME}"
+        ENV_NAME_DOTS = replace(env.ENV_NAME,"-",".")
+        BRANCH_DASHES = replace(env.CHANGE_BRANCH,"/","-")
+        RELEASE_VERSION = replace(env.BRANCH_DASHES,"-",".")
+    }
+
+    stages {
+
+        stage('check tools') {
+            steps {
+                script {
+                    utils.checkTools()
+                }
+            }
+        }
+        
+        stage ('development pipeline'){
+            when { 
+                anyOf {
+                    expression { 
+                        env.GIT_BRANCH =~ /PR\-\d+/ 
+                    };
+                    not { 
+                        environment name: 'GIT_BRANCH',
+                        value: 'master'
+                    }
+                }
+            }
+            stages {
+                stage('run unit tests') {
+                    steps {
+                        echo "Running unit tests"
+                        script {
+                            utils.go("test -coverprofile=coverage.out")
+                        }
+                    }
+                }
+                stage('sonar scanner') {
+                    steps {
+                        echo "Executing sonar scanner"
+                        script {
+                            utils.sonar(env.REPO_NAME)
+                        }
+                    }
+                }
+                stage('quality check') {
+                    steps {
+                        echo "Quality check"
+                        script {
+                            utils.qualityCheck(env.REPO_NAME)
+                        }
+                    }
+                }                
+            }
+        }
+
+
+
+        stage('staging pipeline'){
+            when {
+                expression { env.GIT_BRANCH =~ /PR\-\d+/ }
+            }
+            stages{
+                stage('build docker image'){
+                    steps {
+                        echo "Building docker image"
+                        script {
+                            def buildImage = docker.build("${DOCKER_IMAGE}")
+                            buildImage.push()
+                        }
+                    }
+                }
+                stage('package chart') {
+                    steps {
+                        script {
+                            utils.envsubst(env.REPO_NAME,"template.yaml")
+                            helm.init()
+                            helm.pushNewChart(env.REPO_NAME, env.GIT_BRANCH)
+                        }
+                    }
+                }
+                stage('create environment chart'){
+                    steps {
+                        script {
+                            helm.createEnv(env.REPO_NAME,env.RELEASE_VERSION)
+                            mergeFiles("staging","environment")
+                            helm.installChart(env.BRANCH_DASHES, "environment", env.BRANCH_DASHES)
+                        }
+                    }
+                }
+                stage('download integration pack'){
+                    steps {
+                        git(
+                            url: 'git@bitbucket.org:k8sdemo/integration.git',
+                            credentialsId: 'ssh-bitbucket',
+                            branch: "master"
+                        )
+                    }
+                } 
+            }
+        }
+
+        stage('integration tests') {
+            when {
+                expression { env.GIT_BRANCH =~ /PR\-\d+/ }
+            }
+            environment { 
+                SERVICE_IP = sh(returnStdout: true, script: "kubectl get svc --namespace ${env.BRANCH_DASHES} \
+                -l app=k8s-frontend -o json | jq -r \'.items[].status.loadBalancer.ingress[0].ip\'")
+            }
+            parallel {
+                stage('testOne') {
+                    steps {
+                        script {
+                            utils.integrationTest(env.SERVICE_IP)
+                        }
+                    }
+                }
+                stage('testTwo') {
+                    steps {
+                        script {
+                            utils.integrationTest(env.SERVICE_IP)
+                        }
+                    }
+                }
+                stage('testThree') {
+                    steps {
+                        script {
+                            utils.integrationTest(env.SERVICE_IP)
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('get candidate name') {
+            when {
+                    environment name: 'GIT_BRANCH', 
+                    value: 'master' 
+            }
+            steps {
+                script {
+                    helm.transformCommitMessage()
+                    commit = readFile "commit"
+                }
+            }
+        }
+
+        stage('production pipeline') {
+            when {
+                    environment name: 'GIT_BRANCH', 
+                    value: 'master' 
+            }
+            parallel {
+                stage('install production') {
+                    steps {
+                        script {
+                            helm.promoteChart(env.REPO_NAME,commit,env.ENV_NAME)
+                            mergeFiles("prod","chart")
+                            helm.installChart(env.REPO_NAME, "chart/${env.REPO_NAME}", "master")
+                        }
+                    }
+                }
+                stage('cleanup staging') {
+                    steps {
+                        script {
+                            helm.cleanup(env.REPO_NAME,commit)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

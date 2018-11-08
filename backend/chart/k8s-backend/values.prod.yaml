@@ -1,0 +1,7 @@
+replicaCount: 3
+
+service:
+  type: NodePort
+
+
+  
